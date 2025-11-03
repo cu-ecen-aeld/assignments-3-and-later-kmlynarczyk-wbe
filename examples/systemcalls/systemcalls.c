@@ -1,3 +1,10 @@
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <fcntl.h>
+
 #include "systemcalls.h"
 
 /**
@@ -16,8 +23,17 @@ bool do_system(const char *cmd)
  *   and return a boolean true if the system() call completed with success
  *   or false() if it returned a failure
 */
+    const int retval = system(cmd);
 
-    return true;
+    if(retval == -1) {
+        return false;
+    }
+
+    if(WIFEXITED(retval)) {
+        return (WEXITSTATUS(retval) == 0);
+    } else {
+        return false;
+    }
 }
 
 /**
@@ -45,9 +61,11 @@ bool do_exec(int count, ...)
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
+    va_end(args);
+
     // this line is to avoid a compile warning before your implementation is complete
     // and may be removed
-    command[count] = command[count];
+    //command[count] = command[count];
 
 /*
  * TODO:
@@ -59,9 +77,37 @@ bool do_exec(int count, ...)
  *
 */
 
-    va_end(args);
+    fflush(stdout);
+    fflush(stderr);
 
-    return true;
+    bool funret = false;
+    pid_t pid = fork();
+
+    if(pid < 0) {
+        perror("fork error");
+    } else if(pid == 0) {
+        // child process
+        execv(command[0], command);
+        perror("execv in child error");
+        _exit(127);
+    } else {
+        // parent process
+        int status;
+
+        if(waitpid(pid, &status, 0) == -1) {
+            perror("waitpid in parent error");
+        } else if (WIFEXITED(status)) {
+            funret = (WEXITSTATUS(status) == 0);
+        }
+
+        if(funret) {
+            fprintf(stdout, "parent success\n");
+        } else {
+            perror("parent failure");
+        }
+    }
+
+    return funret;
 }
 
 /**
@@ -80,9 +126,10 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
+    va_end(args);
     // this line is to avoid a compile warning before your implementation is complete
     // and may be removed
-    command[count] = command[count];
+    //command[count] = command[count];
 
 
 /*
@@ -93,7 +140,50 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *
 */
 
-    va_end(args);
+    bool funret = false;
+    int fd = open(outputfile, O_WRONLY|O_TRUNC|O_CREAT, 0644);
 
-    return true;
+    if(fd < 0) {
+        perror("open() failure");
+        funret = false;
+    } else {
+        fflush(stdout);
+        fflush(stderr);
+
+        pid_t pid = fork();
+
+        if(pid < 0) {
+            perror("fork error");
+        } else if(pid == 0) {
+            // child process
+
+            if(dup2(fd, 1) < 0) {
+                perror("dup2 error");
+            } else {
+                close(fd);
+                execv(command[0], command);
+                perror("execv in child error");
+            }
+            _exit(127);
+        } else {
+            // parent process
+            close(fd);
+
+            int status;
+
+            if(waitpid(pid, &status, 0) == -1) {
+                perror("waitpid in parent error");
+            } else if (WIFEXITED(status)) {
+                funret = (WEXITSTATUS(status) == 0);
+            }
+
+            if(funret) {
+                fprintf(stdout, "parent success\n");
+            } else {
+                perror("parent failure");
+            }
+        }
+    }
+
+    return funret;
 }
