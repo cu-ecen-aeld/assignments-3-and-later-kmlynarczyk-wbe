@@ -13,20 +13,142 @@
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <sys/queue.h>
+#include <time.h>
 
+#ifndef SLIST_FOREACH_SAFE
+#define	SLIST_FOREACH_SAFE(var, head, field, tvar)			\
+	for ((var) = SLIST_FIRST(head);				\
+	    (var) && ((tvar) = SLIST_NEXT(var, field), 1);		\
+	    (var) = (tvar))
+#endif
+
+static const char* out_filepath = "/var/tmp/aesdsocketdata";
 static bool caught_signal = false;
 static int server_fd = -1;
-static int client_fd = -1;
+
+struct thread_data {
+    pthread_t thread_id;
+    pthread_mutex_t* out_file_mutex;
+    int client_fd;
+    bool completed;
+
+    SLIST_ENTRY(thread_data) threads;
+};
+
+SLIST_HEAD(slisthead, thread_data);
+
+static void *thread_start(void *thread_param) {
+    struct thread_data *data = (struct thread_data *)thread_param;
+    data->completed = false;
+
+    syslog(LOG_INFO, "Thread #%ld started working", data->thread_id);
+
+    char buffer[128 * 1024];
+    char line_buffer[128 * 1024];
+    size_t linepos = 0;
+
+    while(!caught_signal) {
+        ssize_t n = read(data->client_fd, buffer, sizeof(buffer) - 1);
+
+        if(n < 0) {
+            int tmp_errno = errno;
+            if(tmp_errno == EINTR) {
+                continue;
+            }
+
+            syslog(LOG_ERR, "Thread #%ld: Error %d (%s) on read()", data->thread_id, tmp_errno, strerror(tmp_errno));
+            break;
+        } else if(n == 0) {
+            syslog(LOG_INFO, "Thread #%ld: Closed connection", data->thread_id);
+            break;
+        }
+
+        int rc = pthread_mutex_lock(data->out_file_mutex);
+
+        if(rc != 0) {
+            syslog(LOG_ERR, "Thread #%ld: failed to lock mutex", data->thread_id);
+            break;
+        }
+
+        FILE * out_file = fopen(out_filepath, "a+");
+
+        if(out_file == NULL) {
+            pthread_mutex_unlock(data->out_file_mutex);
+            syslog(LOG_ERR, "Thread #%ld: failed to open file %s", data->thread_id, out_filepath);
+            break;
+        }
+
+        for(ssize_t i = 0; i < n; ++i) {
+            char c = buffer[i];
+
+            if(c == '\n') {
+                line_buffer[linepos] = '\0';
+                fprintf(out_file, "%s\n", line_buffer);
+                syslog(LOG_DEBUG, "Thread #%ld: Appended line: %s", data->thread_id, line_buffer);
+                linepos = 0;
+            } else {
+                if(linepos < sizeof(line_buffer) - 1) {
+                    line_buffer[linepos++] = c;
+                } else {
+                    syslog(LOG_ERR, "Thread #%ld: line_buffer overflow at %ld", data->thread_id, i);
+                }
+            }
+        }
+
+        if(out_file) {
+            fflush(out_file);
+            fclose(out_file);
+            out_file = NULL;
+        }
+
+        int in_fd = open(out_filepath, O_RDONLY);
+
+        if(in_fd < 0) {
+            pthread_mutex_unlock(data->out_file_mutex);
+            syslog(LOG_ERR, "Thread #%ld: failure on in_fd = open()", data->thread_id);
+            break;
+        }
+
+        off_t offset = 0;
+        struct stat st;
+
+        if(fstat(in_fd, &st) < 0) {
+            pthread_mutex_unlock(data->out_file_mutex);
+            syslog(LOG_ERR, "Thread #%ld: Error %d (%s) on fstat()", data->thread_id, errno, strerror(errno));
+            close(in_fd);
+            break;
+        }
+
+        ssize_t sent;
+        while (offset < st.st_size) {
+            sent = sendfile(data->client_fd, in_fd, &offset, st.st_size - offset);
+            if (sent < 0) {
+                syslog(LOG_ERR, "Error %d (%s) on sendfile()", errno, strerror(errno));
+                break;
+            }
+        }
+
+        close(in_fd);
+
+        rc = pthread_mutex_unlock(data->out_file_mutex);
+
+        if(rc != 0) {
+            syslog(LOG_ERR, "Thread #%ld: failed to unlock mutex", data->thread_id);
+            break;
+        }
+    }
+
+    syslog(LOG_INFO, "Thread #%ld finished working", data->thread_id);
+    data->completed = true;
+    return thread_param;
+}
 
 static void signal_handler(int signal_number) {
     caught_signal = (signal_number == SIGINT || signal_number == SIGTERM);
 
     if(caught_signal) {
-        if(client_fd != -1) {
-            close(client_fd);
-            client_fd = -1;
-        }
-
         if(server_fd != -1) {
             close(server_fd);
             server_fd = -1;
@@ -34,15 +156,68 @@ static void signal_handler(int signal_number) {
     }
 }
 
+static void timer_handler(union sigval sv) {
+    pthread_mutex_t* out_file_mutex = (pthread_mutex_t *)sv.sival_ptr;
+
+    time_t rawtime;
+    struct tm *timeinfo;
+    char buffer[128];
+
+    time(&rawtime);
+    timeinfo = localtime(&rawtime);
+
+    strftime(buffer, sizeof(buffer), "timestamp:%a, %d %b %Y %T %z", timeinfo);
+
+    pthread_mutex_lock(out_file_mutex);
+    FILE * out_file = fopen(out_filepath, "a+");
+
+    if(out_file == NULL) {
+        pthread_mutex_unlock(out_file_mutex);
+        syslog(LOG_ERR, "Failed to open file %s in timer_handler()", out_filepath);
+        return;
+    }
+
+    fprintf(out_file, "%s\n", buffer);
+    fflush(out_file);
+    fclose(out_file);
+
+    pthread_mutex_unlock(out_file_mutex);
+}
+
+static void start_timer(pthread_mutex_t* out_file_mutex) {
+    timer_t timerid;
+    struct sigevent sev;
+    struct itimerspec its;
+
+    memset(&sev, 0, sizeof(struct sigevent));
+    sev.sigev_notify = SIGEV_THREAD;
+    sev.sigev_notify_function = timer_handler;
+    sev.sigev_notify_attributes = NULL;
+    sev.sigev_value.sival_ptr = out_file_mutex;
+
+    if (timer_create(CLOCK_REALTIME, &sev, &timerid) == -1) {
+        syslog(LOG_ERR, "Failed to create timer");
+        return;
+    }
+
+    its.it_value.tv_sec = 10;
+    its.it_value.tv_nsec = 0;
+    its.it_interval.tv_sec = 10;
+    its.it_interval.tv_nsec = 0;
+
+    if (timer_settime(timerid, 0, &its, NULL) == -1) {
+        syslog(LOG_ERR, "Failed to start timer");
+    } else {
+        syslog(LOG_INFO, "Started timer");
+    }
+}
+
 int main(int argc, char** argv) {
     int ret_code = 0;
-    const char* out_filepath = "/var/tmp/aesdsocketdata";
-    FILE *out_file = NULL;
-    char buffer[128 * 1024];
-    char line_buffer[128 * 1024];
-    ssize_t n;
-    size_t linepos = 0;
     int daemon_mode = 0;
+
+    struct slisthead thread_list_head;
+    SLIST_INIT(&thread_list_head);
 
     int opt;
     while ((opt = getopt(argc, argv, "d")) != -1) {
@@ -118,6 +293,11 @@ int main(int argc, char** argv) {
         }
     }
 
+    pthread_mutex_t out_file_mutex;
+    pthread_mutex_init(&out_file_mutex, NULL);
+
+    start_timer(&out_file_mutex);
+
     if(listen(server_fd, 100) < 0) {
         syslog(LOG_ERR, "Error %d (%s) on listen()", errno, strerror(errno));
         ret_code = -1;
@@ -132,7 +312,7 @@ int main(int argc, char** argv) {
 
         syslog(LOG_INFO, "Waiting for connection request.");
 
-        client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
+        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
 
         if(client_fd < 0) {
             if(errno == EINTR) {
@@ -149,105 +329,67 @@ int main(int argc, char** argv) {
 
         syslog(LOG_INFO, "Accepted connection from %s", ip);
 
-        while(!caught_signal) {
-            n = read(client_fd, buffer, sizeof(buffer) - 1);
+        struct thread_data *data, *tmp;
 
-            if(n < 0) {
-                int tmp_errno = errno;
-                if(tmp_errno == EINTR) {
-                    continue;
-                }
-
-                syslog(LOG_ERR, "Error %d (%s) on read()", tmp_errno, strerror(tmp_errno));
-                ret_code = -1;
-                break;
-            } else if(n == 0) {
-                syslog(LOG_INFO, "Closed connection from %s", ip);
-                break;
+        SLIST_FOREACH_SAFE(data, &thread_list_head, threads, tmp) {
+            if(!data->completed) {
+                continue;
             }
 
-            out_file = fopen(out_filepath, "a+");
+            syslog(LOG_INFO, "Joining thread #%ld", data->thread_id);
+            int join_rc = pthread_join(data->thread_id, NULL);
 
-            if(out_file == NULL) {
-                syslog(LOG_ERR, "failed to open file %s", out_filepath);
-                ret_code = -1;
-                goto cleanup;
+            if(join_rc != 0) {
+                syslog(LOG_ERR, "Failed to join thread #%ld", data->thread_id);
+            } else {
+                syslog(LOG_INFO, "Joined thread #%ld", data->thread_id);
             }
 
-            for(ssize_t i = 0; i < n; ++i) {
-                char c = buffer[i];
+            SLIST_REMOVE(&thread_list_head, data, thread_data, threads);
+            free(data);
+        }
 
-                if(c == '\n') {
-                    line_buffer[linepos] = '\0';
-                    fprintf(out_file, "%s\n", line_buffer);
-                    syslog(LOG_DEBUG, "Appended line: %s", line_buffer);
-                    linepos = 0;
-                } else {
-                    if(linepos < sizeof(line_buffer) - 1) {
-                        line_buffer[linepos++] = c;
-                    } else {
-                        syslog(LOG_ERR, "line_buffer overflow at %ld", i);
-                    }
-                }
-            }
+        data = malloc(sizeof(struct thread_data));
+        data->client_fd = client_fd;
+        data->out_file_mutex = &out_file_mutex;
+        data->completed = false;
+        SLIST_INSERT_HEAD(&thread_list_head, data, threads);
 
-            if(out_file) {
-                fflush(out_file);
-                fclose(out_file);
-                out_file = NULL;
-            }
+        int thread_create_rc = pthread_create(&data->thread_id, NULL, thread_start, data);
 
-            int in_fd = open(out_filepath, O_RDONLY);
-
-            if(in_fd < 0) {
-                ret_code = -1;
-                goto cleanup;
-            }
-
-            off_t offset = 0;
-            struct stat st;
-
-            if(fstat(in_fd, &st) < 0) {
-                syslog(LOG_ERR, "Error %d (%s) on fstat()", errno, strerror(errno));
-                close(in_fd);
-                ret_code = -1;
-                goto cleanup;
-            }
-
-            ssize_t sent;
-            while (offset < st.st_size) {
-                sent = sendfile(client_fd, in_fd, &offset, st.st_size - offset);
-                if (sent < 0) {
-                    syslog(LOG_ERR, "Error %d (%s) on sendfile()", errno, strerror(errno));
-                    break;
-                }
-            }
-
-            close(in_fd);
+        if(thread_create_rc != 0) {
+            syslog(LOG_ERR, "Failed to create thread");
         }
     }
 
 cleanup:
-    if(out_file) {
-        fclose(out_file);
-    }
-
     if(caught_signal) {
         syslog(LOG_INFO, "Caught signal, exiting");
         remove(out_filepath);
     }
 
-    if(client_fd != -1) {
-        shutdown(client_fd, SHUT_WR);
+    while(!SLIST_EMPTY(&thread_list_head)) {
+        struct thread_data* data = SLIST_FIRST(&thread_list_head);
 
-        syslog(LOG_INFO, "Waiting for FIN from the client...");
-        while(read(client_fd, buffer, sizeof(buffer)) > 0) {}
-        syslog(LOG_INFO, "Received FIN, closing client socket");
-
-        if(close(client_fd) != 0) {
-            syslog(LOG_ERR, "Error %d (%s) on client_fd close()", errno, strerror(errno));
+        if(!data->completed && data->client_fd != -1) {
+            if(close(data->client_fd) != 0) {
+                syslog(LOG_ERR, "Thread #%ld: Error %d (%s) on client_id close()", data->thread_id, errno, strerror(errno));
+            }
         }
+
+        syslog(LOG_INFO, "Joining thread #%ld", data->thread_id);
+        int join_rc = pthread_join(data->thread_id, NULL);
+
+        if(join_rc != 0) {
+            syslog(LOG_ERR, "Failed to join thread #%ld", data->thread_id);
+        } else {
+            syslog(LOG_INFO, "Joined thread #%ld", data->thread_id);
+        }
+
+        SLIST_REMOVE_HEAD(&thread_list_head, threads);
+        free(data);
     }
+    SLIST_INIT(&thread_list_head);
 
     if(server_fd != -1) {
         if(close(server_fd) != 0) {
@@ -255,9 +397,13 @@ cleanup:
         }
     }
 
+    pthread_mutex_destroy(&out_file_mutex);
+
     if(servinfo) {
         freeaddrinfo(servinfo);
     }
+
+    syslog(LOG_INFO, "Program finished");
 
     closelog();
     return ret_code;
