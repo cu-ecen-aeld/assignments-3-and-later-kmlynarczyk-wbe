@@ -29,24 +29,27 @@
 struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct aesd_circular_buffer *buffer,
             size_t char_offset, size_t *entry_offset_byte_rtn )
 {
-    uint8_t rtn_offs = char_offset;
-    uint8_t out_offs = buffer->out_offs;
+    size_t cumulative_offset = 0;
+    uint8_t index = buffer->out_offs;
+    int count;
+    int max_entries = buffer->full ? AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED :
+                      ((buffer->in_offs - buffer->out_offs + AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED);
 
-    struct aesd_buffer_entry *cur = &buffer->entry[out_offs];
+    for (count = 0; count < max_entries; count++) {
+        struct aesd_buffer_entry *entry = &buffer->entry[index];
 
-    while(rtn_offs > cur->size) {
-        rtn_offs -= cur->size;
-        ++out_offs;
-
-        if(out_offs >= buffer->in_offs) {
-            return NULL;
+        if (char_offset < (cumulative_offset + entry->size)) {
+            if (entry_offset_byte_rtn) {
+                *entry_offset_byte_rtn = char_offset - cumulative_offset;
+            }
+            return entry;
         }
 
-        cur = &buffer->entry[out_offs];
+        cumulative_offset += entry->size;
+        index = (index + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
     }
 
-    *entry_offset_byte_rtn = rtn_offs;
-    return cur;
+    return NULL;
 }
 
 /**
@@ -58,19 +61,15 @@ struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct
 */
 void aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const struct aesd_buffer_entry *add_entry)
 {
-    buffer->entry[buffer->in_offs++] = *add_entry;
+    buffer->entry[buffer->in_offs] = *add_entry;
+    buffer->in_offs = (buffer->in_offs + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
 
-    if(buffer->in_offs > AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED) {
-        buffer->in_offs = 0;
+    if (buffer->full) {
+        buffer->out_offs = (buffer->out_offs + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
     }
 
-    if(buffer->in_offs >= buffer->out_offs) {
+    if (buffer->in_offs == buffer->out_offs) {
         buffer->full = true;
-        ++buffer->out_offs;
-    }
-
-    if(buffer->out_offs > AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED) {
-        buffer->out_offs = 0;
     }
 }
 
